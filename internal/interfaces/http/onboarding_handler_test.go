@@ -3,6 +3,9 @@ package httpapi
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -10,13 +13,50 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"gos/internal/application/usecase"
+	app "gos/internal/domain/application"
 	ob "gos/internal/domain/onboarding"
+	pp "gos/internal/domain/platformparam"
+	project "gos/internal/domain/project"
 	usr "gos/internal/domain/user"
 	"gos/internal/infrastructure/persistence/sqlrepo"
 	_ "modernc.org/sqlite"
 )
 
 type onboardingAuthFake struct{ denied string }
+
+func TestOnboardingHTTPDistinguishesSessionAndResourceConflicts(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"session version", ob.ErrConflict, "onboarding_conflict"},
+		{"wrapped session conflict", fmt.Errorf("%w: immutable identity", ob.ErrConflict), "onboarding_conflict"},
+		{"duplicate application key", app.ErrKeyDuplicated, ""},
+		{"duplicate project key", project.ErrKeyDuplicated, ""},
+		{"duplicate field key", pp.ErrParamKeyDuplicated, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+			onboardingError(c, ob.Session{ID: "session", Version: 5}, tc.err)
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409", w.Code)
+			}
+			var body struct {
+				Code string     `json:"code"`
+				Data ob.Session `json:"data"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Code != tc.code || body.Data.Version != 5 {
+				t.Fatalf("unexpected conflict response: %s", w.Body.String())
+			}
+		})
+	}
+}
 
 func (a onboardingAuthFake) HasPermission(_ context.Context, _ usr.User, code, _, _ string) (bool, error) {
 	return code != a.denied, nil

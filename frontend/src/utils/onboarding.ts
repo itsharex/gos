@@ -1,11 +1,20 @@
+import { isAxiosError } from 'axios'
 import type { OnboardingField, OnboardingParameter, OnboardingRow } from '../types/onboarding'
+
+export function isOnboardingSessionConflict(error: unknown): boolean {
+  if (!isAxiosError<{code?: string; error?: string}>(error) || error.response?.status !== 409) return false
+  const payload = error.response.data
+  // Older servers have no error code. Only the session conflict message requires
+  // a reload; duplicate resource keys must remain editable and retryable.
+  return payload?.code === 'onboarding_conflict' || (!payload?.code && !!payload?.error?.includes('配置已变化或正在保存，请刷新后重试'))
+}
 
 export const onboardingSteps = [
   { key: 'preflight', title: '基础检查', help: '确认已有执行端可用。这里不创建或执行远端管线。' },
   { key: 'identity', title: '项目与应用', help: '选择已有项目或在此创建。应用用于组织发布，不需要填写应用访问地址。' },
   { key: 'pipelines', title: '绑定管线', help: '选择实际使用的 CI/CD 管线。保存后读取参数，不触发构建。' },
-  { key: 'parameters', title: '参数与标准字段', help: '先看管线需要什么，再复用或就地补建标准字段，无需提前规划字库。' },
-  { key: 'template_flow', title: '模板与流程', help: '使用前面确认的配置生成模板；审批属于应用，已有流程不会被默认清空。' },
+  { key: 'parameters', title: '参数与标准字段', help: '为管线参数选择标准字段和取值来源。保存后，下一步会将这些规则整理成发布模板。' },
+  { key: 'template_flow', title: '创建发布模板', help: '确认前面选择的管线和参数，填写模板名称后创建。以后创建发布单时，可直接复用这套配置。' },
   { key: 'review', title: '完成检查', help: '核对每个配置环节。配置完成不代表管线已经执行成功。' },
   { key: 'first_release', title: '开始使用', help: '创建该应用的首个发布单，或继续接入下一个应用。创建不自动执行。' },
 ]

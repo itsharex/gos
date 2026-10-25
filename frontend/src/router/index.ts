@@ -24,6 +24,7 @@ const AgentTaskManagementView = () => import('../views/component/AgentTaskManage
 const AgentScriptManagementView = () => import('../views/component/AgentScriptManagementView.vue')
 const ForbiddenView = () => import('../views/exception/ForbiddenView.vue')
 const LoginView = () => import('../views/login/LoginView.vue')
+const PersonalMCPTokenView = () => import('../views/account/PersonalMCPTokenView.vue')
 const ReleaseOrderCreateView = () => import('../views/release/ReleaseOrderCreateView.vue')
 const ReleaseOrderDetailView = () => import('../views/release/ReleaseOrderDetailView.vue')
 const ReleaseOrderListView = () => import('../views/release/ReleaseOrderListView.vue')
@@ -303,6 +304,12 @@ export const router = createRouter({
           name: 'release-approval-flow-management',
           component: ApprovalFlowManagementView,
           meta: { title: '审批流管理', permission: 'release.template.manage' },
+        },
+        {
+          path: '/me/mcp-tokens',
+          name: 'personal-mcp-tokens',
+          component: PersonalMCPTokenView,
+          meta: { title: '个人 MCP 令牌' },
         },
         {
           path: '/system',

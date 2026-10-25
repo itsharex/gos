@@ -449,6 +449,41 @@ WHERE id = ? AND last_seen_sha = ?;`
 	return affected > 0, nil
 }
 
+// RecordOrder 记录本轮建出的发布单，但不推进 last_seen_sha：派发失败时基线必须停在
+// 原值，下一轮才会继续认领同一个提交并找到这张单补派发。
+func (r *ReleaseAutomationRepository) RecordOrder(
+	ctx context.Context,
+	id string,
+	expectedSeenSHA string,
+	triggeredSHA string,
+	orderID string,
+	checkedAt time.Time,
+	lastError string,
+) (bool, error) {
+	const q = `
+UPDATE release_automation
+SET last_triggered_sha = ?, last_order_id = ?, last_checked_at = ?, last_error = ?
+WHERE id = ? AND last_seen_sha = ?;`
+	result, err := r.db.ExecContext(
+		ctx,
+		q,
+		triggeredSHA,
+		orderID,
+		checkedAt.UTC().UnixNano(),
+		lastError,
+		strings.TrimSpace(id),
+		expectedSeenSHA,
+	)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
 func buildReleaseAutomationWhere(dbDriver string, filter domain.ListFilter) (string, []any) {
 	conditions := make([]string, 0, 3)
 	args := make([]any, 0, 6)

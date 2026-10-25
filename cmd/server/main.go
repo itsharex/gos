@@ -111,6 +111,10 @@ func main() {
 	if err := bootstrap.InitSchema(userRepo); err != nil {
 		log.Fatalf("init user schema: %v", err)
 	}
+	mcpTokenRepo := sqlrepo.NewMCPTokenRepository(db, cfg.Database.Driver)
+	if err := bootstrap.InitSchema(mcpTokenRepo); err != nil {
+		log.Fatalf("init MCP token schema: %v", err)
+	}
 	releaseRepo := sqlrepo.NewReleaseRepository(db, cfg.Database.Driver)
 	if err := bootstrap.InitSchema(releaseRepo); err != nil {
 		log.Fatalf("init release schema: %v", err)
@@ -173,6 +177,7 @@ func main() {
 		releaseStore,
 		time.Duration(cfg.Auth.SessionTTLHours)*time.Hour,
 	)
+	mcpTokenManager := usecase.NewMCPTokenManager(mcpTokenRepo, userRepo)
 	if err := userManagement.EnsureSeedData(
 		context.Background(),
 		cfg.Auth.AdminUsername,
@@ -496,10 +501,25 @@ func main() {
 		announcementHandler,
 		releaseAutomationHandler,
 	)
+	httpapi.NewMCPTokenHandler(mcpTokenManager).RegisterRoutes(router)
+	mcpHandler := httpapi.NewMCPHandler(httpapi.MCPServices{
+		TokenResolver: mcpTokenManager,
+		Release:       releaseOrderHandler,
+		Applications:  handler,
+		Templates:     releaseTemplateHandler,
+		Settings:      releaseSettingsQuery,
+	})
+	apiHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/mcp" {
+			mcpHandler.ServeHTTP(w, r)
+			return
+		}
+		router.ServeHTTP(w, r)
+	})
 
 	server := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           router,
+		Handler:           apiHandler,
 		ReadHeaderTimeout: time.Duration(cfg.Server.ReadHeaderTimeoutSec) * time.Second,
 		ReadTimeout:       time.Duration(cfg.Server.ReadTimeoutSec) * time.Second,
 		WriteTimeout:      time.Duration(cfg.Server.WriteTimeoutSec) * time.Second,

@@ -106,6 +106,9 @@ func onboardingError(c *gin.Context, s ob.Session, err error) {
 		status = http.StatusBadRequest
 	}
 	body := gin.H{"error": err.Error()}
+	if errors.Is(err, ob.ErrConflict) {
+		body["code"] = "onboarding_conflict"
+	}
 	if s.ID != "" {
 		body["data"] = s
 	}

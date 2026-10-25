@@ -2300,6 +2300,97 @@ func (uc *ReleaseOrderManager) GetByID(ctx context.Context, id string) (domain.R
 	return order, nil
 }
 
+// FailUndispatchedOrder 把「建单后从未派发成功」的待执行单置为失败。
+//
+// 发布自动化在补派发窗口用完后用它收尾：这类单没有 queue/build 记录，也没有执行锁，
+// 状态仍是待执行就可以安全终止。任何执行单元已经发起过（有 queue/build URL 或开始
+// 时间）都说明它并非「从未派发」，此时不动它，交给正常的取消/追踪流程。
+func (uc *ReleaseOrderManager) FailUndispatchedOrder(
+	ctx context.Context,
+	id string,
+	reason string,
+) (bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, ErrInvalidID
+	}
+	unlock := uc.lockOrderOperation(id)
+	defer unlock()
+
+	order, err := uc.repo.GetByID(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if order.Status != domain.OrderStatusPending {
+		return false, nil
+	}
+	executions, err := uc.repo.ListExecutions(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	for _, execution := range executions {
+		if strings.TrimSpace(execution.QueueURL) != "" ||
+			strings.TrimSpace(execution.BuildURL) != "" ||
+			execution.StartedAt != nil {
+			return false, nil
+		}
+	}
+
+	now := uc.now()
+	message := strings.TrimSpace(reason)
+	if message == "" {
+		message = "发布单创建后未能派发，已自动终止"
+	}
+	for _, execution := range executions {
+		if execution.Status.IsTerminal() {
+			continue
+		}
+		if _, updateErr := uc.repo.UpdateExecutionByScope(ctx, id, execution.PipelineScope, domain.ExecutionUpdateInput{
+			Status:     domain.ExecutionStatusFailed,
+			QueueURL:   execution.QueueURL,
+			BuildURL:   execution.BuildURL,
+			StartedAt:  execution.StartedAt,
+			FinishedAt: &now,
+			UpdatedAt:  now,
+		}); updateErr != nil && !errors.Is(updateErr, domain.ErrExecutionNotFound) {
+			return false, updateErr
+		}
+	}
+	steps, err := uc.repo.ListSteps(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	for _, step := range steps {
+		if !shouldFinishStepOnCancel(step) {
+			continue
+		}
+		startedAt := step.StartedAt
+		if startedAt == nil {
+			startedAt = &now
+		}
+		if _, updateErr := uc.repo.UpdateStep(ctx, id, step.StepCode, domain.StepUpdateInput{
+			Status:     domain.StepStatusFailed,
+			Message:    message,
+			StartedAt:  startedAt,
+			FinishedAt: &now,
+		}); updateErr != nil && !errors.Is(updateErr, domain.ErrStepNotFound) {
+			return false, updateErr
+		}
+	}
+	if _, err := uc.repo.UpdateStatus(ctx, id, domain.OrderStatusFailed, order.StartedAt, &now, now); err != nil {
+		return false, err
+	}
+	if err := uc.releaseExecutionLocks(ctx, id, domain.ExecutionLockStatusReleased); err != nil {
+		return false, err
+	}
+	logx.Warn("release_order", "fail_undispatched_order",
+		logx.F("order_id", order.ID),
+		logx.F("order_no", order.OrderNo),
+		logx.F("reason", message),
+	)
+	return true, nil
+}
+
 // ListDeploySnapshotsByOrderID 查询并返回指定资源数据。
 func (uc *ReleaseOrderManager) ListDeploySnapshotsByOrderID(ctx context.Context, releaseOrderID string) ([]domain.DeploySnapshot, error) {
 	if uc == nil || uc.repo == nil {

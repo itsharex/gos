@@ -16,7 +16,7 @@ const utilSource = readFileSync(utilURL, 'utf8')
 test('release order list reads the recent commit cell from the persisted order fields', () => {
   assert.match(
     listSource,
-    /const initialColumns:[\s\S]*\{ title: "最近提交", key: "recent_commit", width: 180 \}[\s\S]*\{ title: "操作", key: "actions", width: 160 \}/,
+    /const initialColumns:[\s\S]*\{ title: "最近提交", key: "recent_commit", width: 180 \}[\s\S]*\{ title: "操作", key: "actions", width: 200 \}/,
     'release order list should render the recent commit column before the action column',
   )
   assert.match(

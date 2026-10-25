@@ -262,7 +262,7 @@ const initialColumns: TableColumnsType<ReleaseOrder> = [
   { title: "状态", key: "status", width: 140 },
   { title: "发布名称", dataIndex: "release_name", key: "release_name", width: 100 },
   { title: "发起人", dataIndex: "triggered_by", key: "triggered_by", width: 100 },
-  { title: "创建时间", dataIndex: "created_at", key: "created_at", width: 145 },
+  { title: "创建时间", dataIndex: "created_at", key: "created_at", width: 165 },
   {
     title: "应用名称",
     dataIndex: "application_name",
@@ -270,7 +270,7 @@ const initialColumns: TableColumnsType<ReleaseOrder> = [
     width: 130,
   },
   { title: "最近提交", key: "recent_commit", width: 180 },
-  { title: "操作", key: "actions", width: 160 },
+  { title: "操作", key: "actions", width: 200 },
 ];
 const { columns } = useResizableColumns(initialColumns, {
   minWidth: 100,
@@ -3442,7 +3442,8 @@ function handleOverviewChartResize() {
         :data-source="dataSource"
         :loading="loading"
         :pagination="false"
-        :scroll="{ x: 1355 }"
+        table-layout="fixed"
+        :scroll="{ x: 1415 }"
         @expand="handleApprovalFlowExpand"
       >
         <template #expandedRowRender="{ record }">
@@ -3631,8 +3632,11 @@ function handleOverviewChartResize() {
                 <a-tag
                   v-if="record.concurrent_batch_no"
                   class="dashboard-chip dashboard-chip-neutral"
+                  :title="record.concurrent_batch_name || record.concurrent_batch_no"
                 >
-                  {{ record.concurrent_batch_name || record.concurrent_batch_no }}
+                  <span class="release-order-no-batch-name">{{
+                    record.concurrent_batch_name || record.concurrent_batch_no
+                  }}</span>
                 </a-tag>
               </div>
             </div>
@@ -5613,6 +5617,14 @@ function handleOverviewChartResize() {
   white-space: nowrap;
 }
 
+.release-order-no-batch-name {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .release-name-text,
 .release-app-cell > span {
   color: #334155;
@@ -5621,7 +5633,7 @@ function handleOverviewChartResize() {
 
 .release-name-text {
   display: inline-block;
-  max-width: 188px;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   vertical-align: middle;

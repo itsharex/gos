@@ -2,7 +2,6 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
 import { message, Modal } from 'ant-design-vue'
-import { isAxiosError } from 'axios'
 import { abandonOnboarding, applyOnboardingStep, checkOnboarding, createOnboardingSession, getOnboardingSession, getOnboardingStatus, inspectOnboarding, saveOnboardingDraft } from '../../api/onboarding'
 import { listProjects } from '../../api/project'
 import { listPipelines } from '../../api/pipeline'
@@ -10,7 +9,7 @@ import { listUserOptions } from '../../api/user'
 import { listApprovalFlows } from '../../api/release'
 import { useAuthStore } from '../../stores/auth'
 import type { OnboardingDraft, OnboardingInspection, OnboardingParameter, OnboardingRow, OnboardingSession, OnboardingStatus } from '../../types/onboarding'
-import { newOnboardingParameter, onboardingSourceLabel, onboardingSteps } from '../../utils/onboarding'
+import { isOnboardingSessionConflict, newOnboardingParameter, onboardingSourceLabel, onboardingSteps } from '../../utils/onboarding'
 import { extractHTTPErrorMessage } from '../../utils/http-error'
 
 const route = useRoute(), router = useRouter(), auth = useAuthStore()
@@ -41,6 +40,19 @@ const requiredPermissions = ['application.manage', 'pipeline.view', 'pipeline.ma
 const missingPermissions = computed(() => requiredPermissions.filter(p => !auth.hasPermission(p)))
 const preview = computed(() => draft.value?.params.filter(p => !p.omit) || [])
 const changedFields = computed(() => draft.value?.params.filter(p => !p.omit && p.new_field_name) || [])
+const templateName = computed(() => draft.value?.template_name.trim() || `${draft.value?.identity.name || '应用'}-默认发布`)
+const templateStages = computed(() => [
+  {label: 'CI 构建', id: draft.value?.ci_pipeline_id},
+  {label: 'CD 部署', id: draft.value?.cd_pipeline_id},
+].filter(stage => stage.id).map(stage => ({...stage, name: pipelineOptions.value.find(option => option.value === stage.id)?.label || '管线信息待确认'})))
+const templateInputs = computed(() => preview.value.filter(param => param.value_source === 'release_input'))
+const fixedParamCount = computed(() => preview.value.filter(param => param.value_source === 'fixed').length)
+const automaticParamCount = computed(() => preview.value.filter(param => ['builtin', 'ci_param'].includes(param.value_source)).length)
+const primaryActionLabel = computed(() => step.value.key === 'template_flow' ? '创建发布模板并继续' : '保存并继续')
+const awaitingTemplateCheck = computed(() => step.value.key === 'review' && !!session.value?.refs.template_id && session.value.check.status === 'unknown' && !session.value.check.issues.length)
+const viewingTemplate = computed(() => step.value.key === 'template_flow' && !!session.value?.refs.template_id)
+const stepHeading = computed(() => viewingTemplate.value ? '发布模板已创建' : step.value.title)
+const stepHelp = computed(() => viewingTemplate.value ? '这套管线和参数规则已经保存。可继续完成配置检查，也可在发布模板管理中查看。' : step.value.help)
 
 function accept(value: OnboardingSession, replaceDraft = false) {
   session.value = value
@@ -79,7 +91,9 @@ async function load() {
 }
 async function save() {
   clearTimeout(timer)
-  if (pendingSave) await pendingSave
+  // Another waiting caller may have started a save while this one resumed.
+  // Recheck the queue so each request uses the preceding response's version.
+  while (pendingSave) await pendingSave
   if (conflicted.value) throw new Error('配置已变化，请先重新读取任务再编辑')
   if (!session.value || !draft.value || !dirty.value || locked.value) return
   const snapshot = JSON.parse(JSON.stringify(draft.value)) as OnboardingDraft
@@ -89,7 +103,7 @@ async function save() {
       const result = await saveOnboardingDraft(session.value!, snapshot)
       accept(result); savedJSON.value = JSON.stringify(snapshot); error.value = ''
     } catch (e) {
-      if (isAxiosError(e) && e.response?.status === 409) conflicted.value = true
+      if (isOnboardingSessionConflict(e)) conflicted.value = true
       error.value = extractHTTPErrorMessage(e, '草稿保存失败，修改仍保留在本页'); throw e
     }
     finally { saving.value = false }
@@ -134,18 +148,20 @@ function createField(param: OnboardingParameter, row: OnboardingRow) {
 }
 async function apply() {
   if (!session.value || busy.value) return
+  const submittedStep = step.value.key, hadTemplate = !!session.value.refs.template_id
   busy.value = true; error.value = ''
   try {
     await save()
-    const fingerprint = `${step.value.key}:${JSON.stringify(draft.value)}`
-    if (fingerprint !== applyingFingerprint) { applyingFingerprint = fingerprint; applyingKey = `${step.value.key}-${Date.now()}-${Math.random().toString(36).slice(2)}` }
-    const result = await applyOnboardingStep(session.value, step.value.key, applyingKey)
+    const fingerprint = `${submittedStep}:${JSON.stringify(draft.value)}`
+    if (fingerprint !== applyingFingerprint) { applyingFingerprint = fingerprint; applyingKey = `${submittedStep}-${Date.now()}-${Math.random().toString(36).slice(2)}` }
+    const result = await applyOnboardingStep(session.value, submittedStep, applyingKey)
     accept(result, true)
     activeStep.value = Math.max(0, onboardingSteps.findIndex(s => s.key === result.current_step))
     if (result.current_step === 'parameters') { await readParams(false); await save() }
+    if (submittedStep === 'template_flow' && !hadTemplate && result.refs.template_id) message.success('发布模板已创建，接下来检查配置')
   } catch (e) {
     error.value = extractHTTPErrorMessage(e, '当前步骤保存失败，可修复后重试')
-    if (isAxiosError(e) && e.response?.status === 409) conflicted.value = true
+    if (isOnboardingSessionConflict(e)) conflicted.value = true
     // Do not silently adopt a concurrent editor's version and then overwrite
     // it with this tab's stale draft. Explicit reload is required on conflict.
     if (conflicted.value) return
@@ -199,7 +215,7 @@ onBeforeUnmount(() => { clearTimeout(timer); window.removeEventListener('beforeu
     <a-alert v-if="error" type="error" show-icon :message="error" description="本页修改仍保留；保存冲突时可重新读取任务。已完成的资源不会重复创建。"><template #action><a-button :disabled="busy || saving" @click="load">重新读取</a-button></template></a-alert>
     <a-spin :spinning="loading"><template v-if="session && draft">
       <nav class="step-nav" aria-label="接入步骤"><button v-for="(item, index) in onboardingSteps" :key="item.key" :class="{active: activeStep === index}" :aria-current="activeStep === index ? 'step' : undefined" :disabled="busy || index > Math.max(activeStep, onboardingSteps.findIndex(s => s.key === session!.current_step))" @click="activeStep = index"><span>{{ index + 1 }}</span>{{ item.title }}</button></nav>
-      <section class="wizard-panel"><div ref="headingRef" class="step-heading"><h2>{{ step.title }}</h2><p>{{ step.help }}</p></div>
+      <section class="wizard-panel"><div ref="headingRef" class="step-heading"><h2>{{ stepHeading }}</h2><p>{{ stepHelp }}</p></div>
         <a-alert v-if="session.status === 'abandoned'" message="任务已放弃。原有资源仍保留，可在应用列表重新发起接入。" type="warning" show-icon />
         <a-alert v-else-if="locked && activeStep < 5" message="模板已经存在，本页只读。需要修改请使用高级配置，完成后回来重新检查。" type="info" show-icon />
         <a-button v-if="locked && session.status === 'blocked' && session.current_step === 'template_flow' && step.key === 'template_flow'" :loading="busy" @click="apply">重试保存应用流程</a-button>
@@ -258,24 +274,36 @@ onBeforeUnmount(() => { clearTimeout(timer); window.removeEventListener('beforeu
             <a-form v-if="sourceNeeds.repo || sourceNeeds.branch" layout="vertical" :disabled="busy || locked" class="check-card"><a-checkbox v-model:checked="draft.save_app_sources">将以下信息同步到应用配置</a-checkbox><p class="muted">仓库地址供管线自动取值；发布分支只用于提供下拉候选，可留空并在创建发布单时手工填写。已有信息不变时无需勾选。</p><a-form-item v-if="sourceNeeds.repo" label="应用仓库地址"><a-input v-model:value="draft.repo_url" placeholder="管线明确需要的仓库来源" /></a-form-item><a-form-item v-if="sourceNeeds.branch" label="发布分支候选（可选）"><a-input v-model:value="draft.branch" placeholder="例如 main；留空时发布单可手工填写" /></a-form-item></a-form>
           </template>
           <a-form v-else-if="step.key === 'template_flow'" layout="vertical" :disabled="busy || locked">
-            <a-form-item label="模板名称（留空自动使用应用名）"><a-input v-model:value="draft.template_name" :placeholder="`${draft.identity.name}-默认发布`" :maxlength="100" /></a-form-item>
-            <div class="check-card"><b>当前发布方式</b><p>{{ draft.ci_pipeline_id ? '包含构建阶段' : '不含构建阶段' }} · {{ draft.cd_pipeline_id ? '包含部署阶段' : '不含部署阶段' }}。创建发布单不会执行；构建、部署及审批沿用现有平台规则。</p></div>
+            <a-form-item label="发布模板名称" :extra="`留空时使用“${draft.identity.name}-默认发布”。以后创建发布单时，按这个名称选择模板。`"><a-input v-model:value="draft.template_name" :placeholder="`${draft.identity.name}-默认发布`" :maxlength="100" /></a-form-item>
+            <section class="template-review" aria-label="发布模板配置">
+              <div class="template-review-heading"><div><h3>{{ session.refs.template_id ? '已保存的发布模板' : '即将创建的发布模板' }}</h3><p>{{ session.refs.template_id ? '这套配置已保存，创建发布单时可直接选用。' : '将下面的管线和参数规则保存为当前应用可复用的发布配置。' }}</p></div><a-tag color="blue">{{ templateStages.length === 2 ? '构建后部署' : draft.ci_pipeline_id ? '仅构建' : draft.cd_pipeline_id ? '独立部署' : '尚未绑定管线' }}</a-tag></div>
+              <dl class="template-identity"><div><dt>所属应用</dt><dd>{{ draft.identity.name }}</dd></div><div><dt>模板名称</dt><dd>{{ templateName }}</dd></div></dl>
+              <div class="template-stages"><div v-for="(stage, index) in templateStages" :key="stage.label" class="template-stage"><span class="template-stage-number">{{ index + 1 }}</span><div><span>{{ stage.label }}</span><strong>{{ stage.name }}</strong></div></div></div>
+              <div class="template-param-summary"><span>发布时填写 <b>{{ templateInputs.length }}</b> 项</span><span>固定值 <b>{{ fixedParamCount }}</b> 项</span><span>自动取值 <b>{{ automaticParamCount }}</b> 项</span></div>
+              <p v-if="templateInputs.length" class="template-input-hint">每次发布需要填写：{{ templateInputs.map(param => `${param.scope.toUpperCase()} · ${param.name}`).join('、') }}。</p>
+              <p v-else class="template-input-hint">当前模板的管线参数均按已配置的规则取值，无需每次重新填写。</p>
+              <a-button v-if="!locked" type="link" @click="activeStep = 3">返回核对参数</a-button>
+            </section>
+            <h3 class="approval-heading">应用审批（可选）</h3>
             <a-checkbox v-model:checked="draft.change_approval_flow">明确设置此应用的审批流程</a-checkbox>
             <a-form-item v-if="draft.change_approval_flow" label="应用审批流程"><a-select v-model:value="draft.approval_flow_id" allow-clear :options="flowOptions" placeholder="不选择表示无审批流程" @clear="draft.approval_flow_id = ''" /></a-form-item>
             <p v-else class="muted">保留应用现有审批设置；新应用默认无流程。审批不属于模板。</p>
+            <p v-if="!locked" class="template-create-hint">确认后点击下方「创建发布模板并继续」。创建完成后进入配置检查，检查通过后再创建首个发布单。</p>
           </a-form>
         </fieldset>
         <template v-if="['parameters', 'template_flow', 'review', 'first_release'].includes(step.key)">
-          <details class="preview" :open="activeStep >= 4"><summary>发布表单预览与配置摘要（{{ preview.length }} 项）</summary><div v-for="param in preview" :key="param.scope + param.name" class="preview-row"><span>{{ param.scope.toUpperCase() }} · {{ param.name }} <small>{{ param.param_key }}</small></span><span>{{ onboardingSourceLabel(param, inspection.fields) }}</span></div><p v-if="!preview.length" class="muted">当前模板无额外管线参数。</p></details>
+          <details class="preview" :open="activeStep >= 4"><summary>发布表单预览与配置摘要（{{ preview.length }} 项）</summary><div v-for="param in preview" :key="param.scope + param.name" class="preview-row"><span>{{ param.scope.toUpperCase() }} · {{ param.name }} <small>{{ param.param_key }}</small></span><span>{{ onboardingSourceLabel(param, inspection.fields) }}<small v-if="param.value_source === 'fixed'">{{ param.fixed_value || '空值' }}</small></span></div><p v-if="!preview.length" class="muted">当前模板无额外管线参数。</p></details>
         </template>
         <div v-if="['review', 'first_release'].includes(step.key)" class="completion">
-          <a-alert :type="session.check.status === 'ready' ? 'success' : 'warning'" :message="session.status === 'verified' ? '首单实际执行成功' : session.check.status === 'ready' ? '配置完成，可以创建发布单' : '尚未通过配置检查'" :description="session.status === 'verified' ? '可继续新增应用，共用已有项目和标准字段。' : '配置检查不会执行管线，也不代表发布成功。'" show-icon />
-          <a-button :loading="busy" :disabled="session.status === 'abandoned'" @click="check">重新检查配置 / 首单状态</a-button>
+          <a-alert v-if="awaitingTemplateCheck" type="info" message="发布模板已创建，下一步检查配置" description="点击「检查配置并继续」，核对应用、管线、参数和审批配置。通过后即可创建首个发布单。" show-icon />
+          <a-alert v-else :type="session.check.status === 'ready' ? 'success' : 'warning'" :message="session.status === 'verified' ? '首单实际执行成功' : session.check.status === 'ready' ? '配置完成，可以创建发布单' : '尚未通过配置检查'" :description="session.status === 'verified' ? '可继续新增应用，共用已有项目和标准字段。' : '配置检查不会执行管线，也不代表发布成功。'" show-icon />
+          <a-button :type="step.key === 'review' ? 'primary' : 'default'" :loading="busy" :disabled="session.status === 'abandoned'" @click="check">{{ step.key === 'review' ? '检查配置并继续' : '重新检查配置 / 首单状态' }}</a-button>
+          <a-button v-if="step.key === 'review' && session.refs.template_id" @click="router.push({path: '/release-templates', query: {application_id: session.refs.application_id}})">查看发布模板</a-button>
           <template v-if="step.key === 'first_release' && session.check.status === 'ready'"><a-button type="primary" :disabled="busy || !auth.hasApplicationPermission('release.create', session.refs.application_id)" @click="firstRelease">{{ session.first_release_order_id ? '查看首个发布单' : '创建首个发布单（不执行）' }}</a-button><a-button :loading="busy" @click="nextApp">继续接入下一个应用</a-button></template>
         </div>
         <div v-if="session.check.issues?.length" class="issues"><a-alert v-for="(issue, index) in session.check.issues" :key="index" type="error" :message="issue.message" :description="issue.remedy" show-icon><template #action><a-button @click="activeStep = Math.max(0, onboardingSteps.findIndex(s => s.key === issue.step))">返回修复</a-button></template></a-alert></div>
       </section>
-      <footer class="wizard-footer"><div><a-button :disabled="busy || activeStep === 0" @click="activeStep--">上一步</a-button><a-button :loading="saving" :disabled="busy || locked" @click="save().catch(() => undefined)">保存草稿</a-button><a-button v-if="session.status !== 'abandoned'" type="text" :disabled="busy || saving" @click="abandon">放弃任务</a-button></div><div><a-button :disabled="busy" @click="router.push('/system/quick-start')">稍后继续</a-button><a-button v-if="activeStep < 6 && !locked" type="primary" :loading="busy" :disabled="saving || !!optionsError" @click="apply">保存并继续</a-button><a-button v-else-if="activeStep < 5" type="primary" :disabled="busy" @click="activeStep++">查看下一步</a-button></div></footer>
+      <footer class="wizard-footer"><div><a-button :disabled="busy || activeStep === 0" @click="activeStep--">上一步</a-button><a-button :loading="saving" :disabled="busy || locked" @click="save().catch(() => undefined)">保存草稿</a-button><a-button v-if="session.status !== 'abandoned'" type="text" :disabled="busy || saving" @click="abandon">放弃任务</a-button></div><div><a-button :disabled="busy" @click="router.push('/system/quick-start')">稍后继续</a-button><a-button v-if="activeStep < 6 && !locked" type="primary" :loading="busy" :disabled="saving || !!optionsError" @click="apply">{{ primaryActionLabel }}</a-button><a-button v-else-if="activeStep < 5" type="primary" :disabled="busy" @click="activeStep++">查看下一步</a-button></div></footer>
       <aside class="advanced-links"><span>高级配置：</span><router-link v-if="session.refs.application_id" :to="`/applications/${session.refs.application_id}/edit`">应用信息</router-link><router-link v-if="session.refs.application_id" :to="`/applications/${session.refs.application_id}/pipeline-bindings`">管线绑定</router-link><router-link :to="{path: '/release-templates', query: {application_id: session.refs.application_id}}">发布模板</router-link><router-link to="/platform-param-dicts">标准字库</router-link><router-link to="/components/executor-params">参数映射</router-link></aside>
     </template></a-spin>
   </main>
@@ -283,4 +311,28 @@ onBeforeUnmount(() => { clearTimeout(timer); window.removeEventListener('beforeu
 
 <style scoped>
 .onboarding-wizard{max-width:1320px;margin:0 auto;padding:24px;min-width:0}.wizard-header{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:24px}.wizard-header h1{font-size:28px;margin:8px 0;overflow-wrap:anywhere}.wizard-header p,.step-heading p,.muted{color:#64748b;line-height:1.75}.wizard-header .ant-btn{padding-left:0}.step-nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 20px}.step-nav button{display:flex;align-items:center;gap:7px;background:#fff;border:1px solid #dbe3ef;border-radius:9px;padding:10px 12px;color:#475569;cursor:pointer}.step-nav button span{background:#eef2f8;border-radius:50%;width:22px;height:22px;display:grid;place-items:center}.step-nav button.active{color:#1d4ed8;border-color:#3b82f6;background:#eff6ff}.step-nav button:disabled{opacity:.5;cursor:default}.wizard-panel{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:28px;min-width:0}.step-heading{margin-bottom:24px}.step-heading h2{margin:0;font-size:22px}.step-fields{border:0;margin:0;padding:0;min-width:0}.step-fields:disabled{opacity:.85}.form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.check-card{border:1px solid #e2e8f0;background:#f8fafc;border-radius:10px;padding:18px;margin:16px 0}.check-card>b{margin-right:16px}.parameter-toolbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:0 0 20px}.parameter-card{border:1px solid #dce4ef;border-radius:12px;padding:20px;margin:16px 0;overflow-wrap:anywhere}.parameter-card.invalid{border-color:#fca5a5}.parameter-title{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.parameter-title h3{font-size:16px;margin:0}.parameter-title>span{font-size:12px;color:#64748b}.param-form{margin-top:16px}.param-form .ant-select{width:100%}.preview{margin:24px 0;background:#f8fafc;border-radius:10px;padding:18px}.preview summary{cursor:pointer;font-weight:600}.preview-row{display:flex;gap:16px;justify-content:space-between;padding:12px 0;border-bottom:1px solid #e2e8f0;overflow-wrap:anywhere}.preview-row>span{min-width:0}.preview-row small{display:block;color:#64748b}.completion,.issues{display:flex;gap:14px;flex-wrap:wrap;margin:20px 0}.completion>.ant-alert,.issues>.ant-alert{width:100%}.wizard-footer{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;margin:20px 0}.wizard-footer>div{display:flex;gap:10px;flex-wrap:wrap}.advanced-links{display:flex;gap:16px;flex-wrap:wrap;color:#64748b;font-size:13px}.ant-alert{margin-bottom:14px}.ant-form-item{margin-top:14px}button:focus-visible,summary:focus-visible{outline:2px solid #2563eb;outline-offset:3px}@media(max-width:760px){.onboarding-wizard{padding:12px}.wizard-panel{padding:18px}.form-grid{grid-template-columns:1fr;gap:0}.preview-row{flex-direction:column;gap:6px}.step-nav button{font-size:12px;padding:8px}.wizard-footer{flex-direction:column}.wizard-footer>div{width:100%}}
+</style>
+
+<style scoped>
+.template-review{border:1px solid #dbe3ef;border-radius:12px;padding:22px;background:#f8fafc;margin:22px 0;overflow-wrap:anywhere}
+.template-review-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}
+.template-review-heading h3{font-size:16px;margin:0 0 6px;color:#1e293b}
+.template-review-heading p{margin:0;color:#64748b;line-height:1.7}
+.template-review-heading .ant-tag{margin:0;flex-shrink:0}
+.template-identity{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;margin:20px 0}
+.template-identity dt{font-size:12px;color:#64748b;margin-bottom:5px}
+.template-identity dd{margin:0;color:#1e293b;font-weight:600}
+.template-stages{display:flex;gap:12px;flex-wrap:wrap}
+.template-stage{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid #e2e8f0;border-radius:9px;padding:14px 16px;flex:1;min-width:0}
+.template-stage-number{display:grid;place-items:center;flex-shrink:0;width:28px;height:28px;background:#eff6ff;color:#2563eb;border-radius:50%;font-weight:600}
+.template-stage>div{min-width:0;display:grid;gap:4px}
+.template-stage>div>span{font-size:12px;color:#64748b}
+.template-stage strong{font-size:14px;color:#334155}
+.template-param-summary{display:flex;gap:20px;flex-wrap:wrap;margin:20px 0 8px;color:#475569;font-size:13px}
+.template-param-summary b{color:#1e293b}
+.template-input-hint{font-size:13px;color:#64748b;line-height:1.8;margin:0}
+.template-review>.ant-btn{padding-left:0;margin-top:6px}
+.approval-heading{font-size:15px;margin:24px 0 12px}
+.template-create-hint{border-left:3px solid #3b82f6;padding:10px 14px;background:#eff6ff;color:#1e40af;font-size:13px;line-height:1.8;margin:20px 0 0}
+@media(max-width:760px){.template-review{padding:16px}.template-review-heading{flex-wrap:wrap}.template-identity{grid-template-columns:1fr;gap:14px}.template-stages{flex-direction:column}.template-param-summary{gap:12px}}
 </style>

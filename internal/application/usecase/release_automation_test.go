@@ -35,6 +35,7 @@ type releaseAutomationRepoFake struct {
 	// commitResults 可选：按顺序覆写 CAS 结果（false 表示抢占失败）。
 	commitResults []bool
 	commitCalls   int
+	recordCalls   int
 	checkStates   int
 }
 
@@ -220,6 +221,35 @@ func (r *releaseAutomationRepoFake) CommitTrigger(
 	return true, nil
 }
 
+// RecordOrder 与真实仓储一致：只记录单号和检查结果，不推进基线。
+func (r *releaseAutomationRepoFake) RecordOrder(
+	_ context.Context,
+	id string,
+	expectedSeenSHA string,
+	triggeredSHA string,
+	orderID string,
+	checkedAt time.Time,
+	lastError string,
+) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recordCalls++
+	item, ok := r.items[id]
+	if !ok {
+		return false, nil
+	}
+	if item.LastSeenSHA != expectedSeenSHA {
+		return false, nil
+	}
+	checked := checkedAt
+	item.LastTriggeredSHA = triggeredSHA
+	item.LastOrderID = orderID
+	item.LastCheckedAt = &checked
+	item.LastError = lastError
+	r.items[id] = item
+	return true, nil
+}
+
 type releaseAutomationAppStub struct {
 	app appdomain.Application
 	err error
@@ -265,6 +295,31 @@ type releaseAutomationOrderStub struct {
 	panicOnRun       bool
 	panicOnce        bool
 	panicked         bool
+
+	// ordersByID 模拟上一轮已经落库的发布单，供补派发路径读取；
+	// 未登记的单返回 ErrOrderNotFound。
+	ordersByID map[string]releasedomain.ReleaseOrder
+	// failUndispatched 记录被自动化超时终止的单。
+	failUndispatched []string
+	failErr          error
+	// openOrderCutoff 记录轮询传给仓储的「阻塞单」创建时间下限。
+	openOrderCutoff time.Time
+}
+
+func (s *releaseAutomationOrderStub) GetByID(_ context.Context, id string) (releasedomain.ReleaseOrder, error) {
+	order, ok := s.ordersByID[id]
+	if !ok {
+		return releasedomain.ReleaseOrder{}, releasedomain.ErrOrderNotFound
+	}
+	return order, nil
+}
+
+func (s *releaseAutomationOrderStub) FailUndispatchedOrder(_ context.Context, orderID string, _ string) (bool, error) {
+	if s.failErr != nil {
+		return false, s.failErr
+	}
+	s.failUndispatched = append(s.failUndispatched, orderID)
+	return true, nil
 }
 
 func (s *releaseAutomationOrderStub) Create(_ context.Context, input CreateReleaseOrderInput) (releasedomain.ReleaseOrder, error) {
@@ -277,12 +332,13 @@ func (s *releaseAutomationOrderStub) Create(_ context.Context, input CreateRelea
 	}
 	s.created = append(s.created, input)
 	return releasedomain.ReleaseOrder{
-		ID:          "ro-auto-1",
-		OrderNo:     "RO-AUTO-1",
-		Status:      releasedomain.OrderStatusPending,
-		GitRef:      input.GitRef,
-		EnvCode:     input.EnvCode,
-		TriggerType: input.TriggerType,
+		ID:            "ro-auto-1",
+		OrderNo:       "RO-AUTO-1",
+		Status:        releasedomain.OrderStatusPending,
+		ApplicationID: input.ApplicationID,
+		GitRef:        input.GitRef,
+		EnvCode:       input.EnvCode,
+		TriggerType:   input.TriggerType,
 	}, nil
 }
 
@@ -337,7 +393,8 @@ func (s *releaseAutomationOrderStub) FindActiveOrderByApplicationEnv(context.Con
 	return releasedomain.ReleaseOrder{ID: "ro-active", OrderNo: s.activeNo}, nil
 }
 
-func (s *releaseAutomationOrderStub) FindOpenOrderByApplicationEnv(context.Context, string, string, string) (releasedomain.ReleaseOrder, error) {
+func (s *releaseAutomationOrderStub) FindOpenOrderByApplicationEnv(_ context.Context, _ string, _ string, _ string, createdAfter time.Time) (releasedomain.ReleaseOrder, error) {
+	s.openOrderCutoff = createdAfter
 	if s.activeErr != nil {
 		return releasedomain.ReleaseOrder{}, s.activeErr
 	}
@@ -806,6 +863,216 @@ func TestReleaseAutomationRunDiscardsResultWhenCasLoses(t *testing.T) {
 	}
 	if current.LastSeenSHA != "sha-1" {
 		t.Fatalf("LastSeenSHA = %q, want the other replica's value sha-1", current.LastSeenSHA)
+	}
+}
+
+// 建单成功但派发失败：不推进基线，把单挂到配置上；下一轮补派发同一张单，
+// 既不重复建单，也不会被自己建的单永久挡住。
+func TestReleaseAutomationRetriesUndispatchedOrderBeforeCreatingAnother(t *testing.T) {
+	repo := newReleaseAutomationRepoFake()
+	orders := &releaseAutomationOrderStub{}
+	git := &releaseAutomationGitStub{head: HeadCommit{CommitSHA: "sha-1"}}
+	manager := newReleaseAutomationTestManager(t, repo, orders, git)
+
+	created, err := manager.Create(context.Background(), releaseAutomationTestInput())
+	if err != nil {
+		t.Fatalf("Create err = %v", err)
+	}
+	git.head = HeadCommit{CommitSHA: "sha-2"}
+	orders.buildErr = errors.New("读取 Jenkins 真实参数失败")
+
+	first, err := manager.RunDueAutomations(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("RunDueAutomations err = %v", err)
+	}
+	if first.Failed != 1 || first.Triggered != 0 {
+		t.Fatalf("first run = %+v, want failed=1 triggered=0", first)
+	}
+	if len(orders.created) != 1 {
+		t.Fatalf("created %d orders, want 1", len(orders.created))
+	}
+	current, err := repo.GetByID(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetByID err = %v", err)
+	}
+	if current.LastSeenSHA != "sha-1" {
+		t.Fatalf("LastSeenSHA = %q, want the baseline kept at sha-1 after a failed dispatch", current.LastSeenSHA)
+	}
+	if current.LastOrderID != "ro-auto-1" || current.LastTriggeredSHA != "sha-2" {
+		t.Fatalf("trigger trace = %q / %q, want ro-auto-1 / sha-2", current.LastOrderID, current.LastTriggeredSHA)
+	}
+	if !strings.Contains(current.LastError, "Jenkins") {
+		t.Fatalf("LastError = %q, want the dispatch reason", current.LastError)
+	}
+
+	// 下一轮：上一张单仍是待执行，派发恢复后应补派发它，而不是再建一单。
+	now := time.Unix(1700000000, 0).UTC()
+	orders.buildErr = nil
+	orders.actions = nil
+	orders.ordersByID = map[string]releasedomain.ReleaseOrder{
+		"ro-auto-1": {
+			ID:            "ro-auto-1",
+			OrderNo:       "RO-AUTO-1",
+			ApplicationID: releaseAutomationTestAppID,
+			EnvCode:       releaseAutomationTestEnvCode,
+			GitRef:        releaseAutomationTestGitRef,
+			TriggerType:   releasedomain.TriggerTypeAutomation,
+			Status:        releasedomain.OrderStatusPending,
+			HeadCommitSHA: "sha-2",
+			CreatedAt:     now.Add(-time.Minute),
+		},
+	}
+	second, err := manager.RunDueAutomations(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("second RunDueAutomations err = %v", err)
+	}
+	if second.Triggered != 1 {
+		t.Fatalf("second run = %+v, want triggered=1", second)
+	}
+	if strings.Join(orders.actions, ",") != "build" {
+		t.Fatalf("dispatch actions = %v, want [build]", orders.actions)
+	}
+	if len(orders.created) != 1 {
+		t.Fatalf("created %d orders, want no duplicate", len(orders.created))
+	}
+	current, err = repo.GetByID(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetByID err = %v", err)
+	}
+	if current.LastSeenSHA != "sha-2" {
+		t.Fatalf("LastSeenSHA = %q, want sha-2 after the resumed dispatch", current.LastSeenSHA)
+	}
+	if strings.TrimSpace(current.LastError) != "" {
+		t.Fatalf("LastError = %q, want cleared after the resumed dispatch", current.LastError)
+	}
+}
+
+// 用户把该提交的自动单取消掉之后，下一轮不能立刻又建一张同名单。
+func TestReleaseAutomationSkipsCommitAfterItsOrderWasCancelled(t *testing.T) {
+	repo := newReleaseAutomationRepoFake()
+	orders := &releaseAutomationOrderStub{}
+	git := &releaseAutomationGitStub{head: HeadCommit{CommitSHA: "sha-1"}}
+	manager := newReleaseAutomationTestManager(t, repo, orders, git)
+
+	created, err := manager.Create(context.Background(), releaseAutomationTestInput())
+	if err != nil {
+		t.Fatalf("Create err = %v", err)
+	}
+	git.head = HeadCommit{CommitSHA: "sha-2"}
+	orders.buildErr = errors.New("读取 Jenkins 真实参数失败")
+	if _, err := manager.RunDueAutomations(context.Background(), 20); err != nil {
+		t.Fatalf("first RunDueAutomations err = %v", err)
+	}
+
+	// 人工把那张派发不出去的单取消了。
+	now := time.Unix(1700000000, 0).UTC()
+	orders.buildErr = nil
+	orders.ordersByID = map[string]releasedomain.ReleaseOrder{
+		"ro-auto-1": {
+			ID:            "ro-auto-1",
+			OrderNo:       "RO-AUTO-1",
+			ApplicationID: releaseAutomationTestAppID,
+			EnvCode:       releaseAutomationTestEnvCode,
+			GitRef:        releaseAutomationTestGitRef,
+			TriggerType:   releasedomain.TriggerTypeAutomation,
+			Status:        releasedomain.OrderStatusCancelled,
+			HeadCommitSHA: "sha-2",
+			CreatedAt:     now.Add(-time.Minute),
+		},
+	}
+
+	second, err := manager.RunDueAutomations(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("second RunDueAutomations err = %v", err)
+	}
+	if second.Triggered != 0 || len(orders.created) != 1 {
+		t.Fatalf("second run = %+v, created=%d; want the cancelled commit skipped", second, len(orders.created))
+	}
+	if len(orders.actions) != 0 {
+		t.Fatalf("dispatch actions = %v, want none", orders.actions)
+	}
+	current, err := repo.GetByID(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetByID err = %v", err)
+	}
+	if current.LastSeenSHA != "sha-2" {
+		t.Fatalf("LastSeenSHA = %q, want the cancelled commit marked handled", current.LastSeenSHA)
+	}
+}
+
+// 补派发窗口用完后仍是失败：终止那张单并把基线推到它的 HEAD，避免同一个提交反复建单。
+func TestReleaseAutomationAbandonsUndispatchedOrderAfterRetryWindow(t *testing.T) {
+	repo := newReleaseAutomationRepoFake()
+	orders := &releaseAutomationOrderStub{}
+	git := &releaseAutomationGitStub{head: HeadCommit{CommitSHA: "sha-1"}}
+	manager := newReleaseAutomationTestManager(t, repo, orders, git)
+
+	created, err := manager.Create(context.Background(), releaseAutomationTestInput())
+	if err != nil {
+		t.Fatalf("Create err = %v", err)
+	}
+	git.head = HeadCommit{CommitSHA: "sha-2"}
+	orders.buildErr = errors.New("模板参数映射不完整：CI 参数不在 Jenkins 真实候选值中")
+
+	if _, err := manager.RunDueAutomations(context.Background(), 20); err != nil {
+		t.Fatalf("first RunDueAutomations err = %v", err)
+	}
+
+	now := time.Unix(1700000000, 0).UTC()
+	orders.ordersByID = map[string]releasedomain.ReleaseOrder{
+		"ro-auto-1": {
+			ID:            "ro-auto-1",
+			OrderNo:       "RO-AUTO-1",
+			ApplicationID: releaseAutomationTestAppID,
+			EnvCode:       releaseAutomationTestEnvCode,
+			GitRef:        releaseAutomationTestGitRef,
+			TriggerType:   releasedomain.TriggerTypeAutomation,
+			Status:        releasedomain.OrderStatusPending,
+			HeadCommitSHA: "sha-2",
+			CreatedAt:     now.Add(-releaseAutomationDispatchRetryWindow - time.Minute),
+		},
+	}
+
+	second, err := manager.RunDueAutomations(context.Background(), 20)
+	if err != nil {
+		t.Fatalf("second RunDueAutomations err = %v", err)
+	}
+	if second.Failed != 1 {
+		t.Fatalf("second run = %+v, want failed=1", second)
+	}
+	if len(orders.failUndispatched) != 1 || orders.failUndispatched[0] != "ro-auto-1" {
+		t.Fatalf("failUndispatched = %v, want [ro-auto-1]", orders.failUndispatched)
+	}
+	current, err := repo.GetByID(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("GetByID err = %v", err)
+	}
+	if current.LastSeenSHA != "sha-2" {
+		t.Fatalf("LastSeenSHA = %q, want the commit given up and sha-2 marked handled", current.LastSeenSHA)
+	}
+	if !strings.Contains(current.LastError, "已终止本次发布") {
+		t.Fatalf("LastError = %q, want the abandon reason", current.LastError)
+	}
+}
+
+// 给手工待执行单让路有上限：轮询要按 TTL 传入截止时间，长期弃单不再阻塞自动化。
+func TestReleaseAutomationLimitsManualOrderYieldWindow(t *testing.T) {
+	repo := newReleaseAutomationRepoFake()
+	orders := &releaseAutomationOrderStub{activeNo: "RO-MANUAL-1"}
+	git := &releaseAutomationGitStub{head: HeadCommit{CommitSHA: "sha-1"}}
+	manager := newReleaseAutomationTestManager(t, repo, orders, git)
+
+	if _, err := manager.Create(context.Background(), releaseAutomationTestInput()); err != nil {
+		t.Fatalf("Create err = %v", err)
+	}
+	git.head = HeadCommit{CommitSHA: "sha-2"}
+	if _, err := manager.RunDueAutomations(context.Background(), 20); err != nil {
+		t.Fatalf("RunDueAutomations err = %v", err)
+	}
+
+	want := time.Unix(1700000000, 0).UTC().Add(-releaseAutomationManualBlockerTTL)
+	if !orders.openOrderCutoff.Equal(want) {
+		t.Fatalf("open order cutoff = %v, want %v", orders.openOrderCutoff, want)
 	}
 }
 

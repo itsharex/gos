@@ -19,6 +19,14 @@ const (
 	releaseAutomationBatchLimit = 50
 	// releaseAutomationLogComponent 是结构化日志的组件名，便于 ELK 按组件过滤。
 	releaseAutomationLogComponent = "release_automation"
+	// releaseAutomationDispatchRetryWindow 是「建单后派发失败」的补派发窗口：
+	// 窗口内每轮轮询都会重试派发，超过窗口仍派不动就把单子置为失败并放弃这个提交，
+	// 避免一张永远发不出去的单永久堵住后续建单。
+	releaseAutomationDispatchRetryWindow = 10 * time.Minute
+	// releaseAutomationManualBlockerTTL 是自动化给人为待执行单让路的上限：
+	// 手工单建出来就挡在自动化前面是合理的（避免互相插队），但长期停在待执行的
+	// 弃单不应该无限期挡住自动化，超过这个时限后不再把它算作阻塞单。
+	releaseAutomationManualBlockerTTL = 24 * time.Hour
 )
 
 // ReleaseAutomationApplicationReader 只取应用名、仓库地址和归属校验，用最小接口隔离
@@ -49,8 +57,14 @@ type ReleaseAutomationOrderDispatcher interface {
 	// releasedomain.ErrOrderNotFound 表示当前没有在途单，可以自动建单。
 	FindActiveOrderByApplicationEnv(ctx context.Context, applicationID string, envCode string) (releasedomain.ReleaseOrder, error)
 	// FindOpenOrderByApplicationEnv 返回同应用同环境下尚未结束（含待执行）的发布单；
-	// 轮询触发用它判断「是否已有手工发布排在前面」。
-	FindOpenOrderByApplicationEnv(ctx context.Context, applicationID string, envCode string, excludeReleaseOrderID string) (releasedomain.ReleaseOrder, error)
+	// 轮询触发用它判断「是否已有手工发布排在前面」。createdAfter 非零时只统计该
+	// 时间之后创建的单，超过让路时限的人为弃单不再阻塞自动化。
+	FindOpenOrderByApplicationEnv(ctx context.Context, applicationID string, envCode string, excludeReleaseOrderID string, createdAfter time.Time) (releasedomain.ReleaseOrder, error)
+	// GetByID 读取发布单，用于识别上一轮建出但没派发成功的单。
+	GetByID(ctx context.Context, id string) (releasedomain.ReleaseOrder, error)
+	// FailUndispatchedOrder 把「建单后从未派发成功」的待执行单置为失败：
+	// 自动化补派发超时后用它终止孤儿单，避免它永久占住同应用同环境的建单入口。
+	FailUndispatchedOrder(ctx context.Context, orderID string, reason string) (bool, error)
 }
 
 // ReleaseAutomationManager 是「发布自动化」的应用层入口：
@@ -138,11 +152,12 @@ func (uc *ReleaseOrderManager) FindOpenOrderByApplicationEnv(
 	applicationID string,
 	envCode string,
 	excludeReleaseOrderID string,
+	createdAfter time.Time,
 ) (releasedomain.ReleaseOrder, error) {
 	if uc == nil || uc.repo == nil {
 		return releasedomain.ReleaseOrder{}, releasedomain.ErrOrderNotFound
 	}
-	return uc.repo.FindOpenOrderByApplicationEnv(ctx, applicationID, envCode, excludeReleaseOrderID)
+	return uc.repo.FindOpenOrderByApplicationEnv(ctx, applicationID, envCode, excludeReleaseOrderID, createdAfter)
 }
 
 // FindActiveOrderByApplicationEnv 返回同应用同环境下第一个在途发布单。
@@ -520,6 +535,12 @@ func (uc *ReleaseAutomationManager) runDueAutomation(
 	}
 	headSHA := strings.TrimSpace(head.CommitSHA)
 
+	// 先收尾上一轮「建单成功、派发失败」留下的待执行单：窗口内补派发，超时则终止。
+	// 它必须排在 HEAD 检查和阻塞检查之前，否则这张自己建的单会把自己挡在门外。
+	if handled, state := uc.reconcileUndispatchedOrder(ctx, item, now); handled {
+		return state
+	}
+
 	// 基线未前进：只刷新检查时间，保持 last_error 为空（读得到分支就是健康）。
 	if automationdomain.HeadUnchanged(item.LastSeenSHA, headSHA) {
 		if err := uc.repo.UpdateCheckState(ctx, item.ID, now, ""); err != nil {
@@ -532,11 +553,50 @@ func (uc *ReleaseAutomationManager) runDueAutomation(
 		return releaseAutomationRunUnchanged
 	}
 
+	// 这个提交曾经由本自动化建过单（last_triggered_sha），现在已经没有待补发的单：
+	// 说明那张单被人工取消/终止了。尊重人的决定，把基线推到该提交，避免用户刚取消
+	// 完、下一轮又立刻建出同一张单。
+	if headSHA != "" && headSHA == strings.TrimSpace(item.LastTriggeredSHA) {
+		committed, commitErr := uc.repo.CommitTrigger(
+			ctx,
+			item.ID,
+			item.LastSeenSHA,
+			headSHA,
+			strings.TrimSpace(item.LastTriggeredSHA),
+			strings.TrimSpace(item.LastOrderID),
+			now,
+			"",
+		)
+		if commitErr != nil {
+			logx.Error(releaseAutomationLogComponent, "poll_commit_trigger_failed", commitErr,
+				logx.F("automation_id", item.ID),
+				logx.F("head_sha", headSHA),
+			)
+			return releaseAutomationRunFailed
+		}
+		logx.Info(releaseAutomationLogComponent, "poll_commit_skipped_terminal_order",
+			logx.F("automation_id", item.ID),
+			logx.F("order_id", strings.TrimSpace(item.LastOrderID)),
+			logx.F("head_sha", headSHA),
+			logx.F("committed", committed),
+		)
+		return releaseAutomationRunUnchanged
+	}
+
 	// 有新提交，但同应用同环境还有在途发布单：本次不建单，也**不推进基线**，
 	// 等在途单结束后下一轮会补建，保证每个提交最终都被发一次。
 	// 用「尚未结束」而不是调度视角的「在途」：手工单只要建出来（哪怕还停在待执行）就先让路，
 	// 不推进基线，等它结束后下一轮再补建，避免同一分支堆出两张单。
-	blocker, blockerErr := uc.orders.FindOpenOrderByApplicationEnv(ctx, item.ApplicationID, item.EnvCode, "")
+	// 让路有时间上限：停在待执行的弃单超过 TTL 后不再算阻塞单。没有上限时，一张
+	// 建完就没人管的待执行单会永久挡住这条自动化，而手工发布根本不看 pending，
+	// 只有自动化会被卡死。
+	blocker, blockerErr := uc.orders.FindOpenOrderByApplicationEnv(
+		ctx,
+		item.ApplicationID,
+		item.EnvCode,
+		"",
+		now.Add(-releaseAutomationManualBlockerTTL),
+	)
 	switch {
 	case blockerErr == nil:
 		reason := fmt.Sprintf("已有在途发布单 %s，本次不创建自动发布单", strings.TrimSpace(blocker.OrderNo))
@@ -583,18 +643,44 @@ func (uc *ReleaseAutomationManager) runDueAutomation(
 		return releaseAutomationRunFailed
 	}
 
+	// 先派发再推进基线：派发失败时基线必须停在原值，否则这个提交会被记成「已处理」，
+	// 而那张没派发出去的单既不会重试，又以「在途单」的身份永久挡住后续建单。
+	// 失败时只把单子挂到配置上（RecordOrder 不推进基线），下一轮由
+	// reconcileUndispatchedOrder 继续补派发。
 	dispatchErr := uc.dispatchAutomationOrder(ctx, item, order)
-	lastError := ""
-	if dispatchErr != nil {
-		// 发布单已经建出来了，这条提交已经有主，因此仍然推进基线：
-		// 否则下一轮会为同一个提交再建一单。派发失败只记在 last_error 上，
-		// 由人工在发布单上重试。
-		lastError = dispatchErr.Error()
+	if dispatchErr != nil && !uc.dispatchLanded(ctx, order.ID) {
+		reason := dispatchErr.Error()
+		if _, recordErr := uc.repo.RecordOrder(
+			ctx,
+			item.ID,
+			item.LastSeenSHA,
+			headSHA,
+			order.ID,
+			now,
+			reason,
+		); recordErr != nil {
+			logx.Warn(releaseAutomationLogComponent, "poll_record_order_failed",
+				logx.F("automation_id", item.ID),
+				logx.F("order_id", order.ID),
+				logx.F("reason", recordErr.Error()),
+			)
+		}
 		logx.Error(releaseAutomationLogComponent, "poll_dispatch_failed", dispatchErr,
 			logx.F("automation_id", item.ID),
 			logx.F("order_id", order.ID),
 			logx.F("order_no", order.OrderNo),
 			logx.F("dispatch_mode", item.DispatchMode),
+		)
+		return releaseAutomationRunFailed
+	}
+	if dispatchErr != nil {
+		// 状态已经推进（例如执行人写库失败这类后半段报错）：单子确实派出去了，
+		// 按成功处理，否则等它跑完会为同一个提交再建一单。
+		logx.Warn(releaseAutomationLogComponent, "poll_dispatch_landed_with_error",
+			logx.F("automation_id", item.ID),
+			logx.F("order_id", order.ID),
+			logx.F("order_no", order.OrderNo),
+			logx.F("reason", dispatchErr.Error()),
 		)
 	}
 
@@ -606,7 +692,7 @@ func (uc *ReleaseAutomationManager) runDueAutomation(
 		headSHA,
 		order.ID,
 		now,
-		lastError,
+		"",
 	)
 	if commitErr != nil {
 		logx.Error(releaseAutomationLogComponent, "poll_commit_trigger_failed", commitErr,
@@ -637,10 +723,236 @@ func (uc *ReleaseAutomationManager) runDueAutomation(
 		logx.F("dispatch_mode", item.DispatchMode),
 		logx.F("head_sha", headSHA),
 	)
-	if dispatchErr != nil {
-		return releaseAutomationRunFailed
-	}
 	return releaseAutomationRunTriggered
+}
+
+// reconcileUndispatchedOrder 收尾「上一轮建单成功、但派发失败」的待执行单。
+//
+// 建单和派发不是原子的：派发可能因为 Jenkins 读参数瞬时失败、预检校验失败等原因没走通。
+// 这张单如果既不重试又留在待执行状态，会同时踩两个坑：提交没有被真正发布；它还会被
+// 当成「同应用同环境尚未结束的单」，把这条自动化永久挡在门外。
+//
+// 语义：
+//   - 重试窗口内每轮都补派发；派发成功才推进基线；
+//   - 如果只是排在别的在途单后面（同应用同环境有 queued/building/running 的单），
+//     继续等待，不进入放弃计时；
+//   - 超过窗口仍派不动，说明是配置/参数这类硬错误：终止这张单并把基线推到它的 HEAD，
+//     放弃这个提交，避免同一个提交反复建单。
+//
+// 返回 handled=false 表示没有需要收尾的遗留单，调用方继续常规的 HEAD 检查。
+func (uc *ReleaseAutomationManager) reconcileUndispatchedOrder(
+	ctx context.Context,
+	item automationdomain.Automation,
+	now time.Time,
+) (handled bool, state releaseAutomationRunState) {
+	orderID := strings.TrimSpace(item.LastOrderID)
+	if orderID == "" {
+		return false, releaseAutomationRunUnchanged
+	}
+	order, err := uc.orders.GetByID(ctx, orderID)
+	if err != nil {
+		if errors.Is(err, releasedomain.ErrOrderNotFound) {
+			return false, releaseAutomationRunUnchanged
+		}
+		uc.markCheckFailed(ctx, item, now, err.Error())
+		return true, releaseAutomationRunFailed
+	}
+	// 配置改过应用/环境/分支后，LastOrderID 可能指向旧身份的单，不要碰它。
+	if !isAutomationOrderOf(item, order) {
+		return false, releaseAutomationRunUnchanged
+	}
+	if order.Status != releasedomain.OrderStatusPending {
+		return false, releaseAutomationRunUnchanged
+	}
+
+	// 建单时解析 HEAD 是异步写库的，下一轮读到的列可能还是空；RecordOrder 在派发
+	// 失败时已经把建单 HEAD 写进 last_triggered_sha，用它兜底，避免补派发成功后
+	// 推不动基线、下一轮又为同一个提交建一单。
+	orderHeadSHA := strings.TrimSpace(order.HeadCommitSHA)
+	if orderHeadSHA == "" {
+		orderHeadSHA = strings.TrimSpace(item.LastTriggeredSHA)
+	}
+	dispatchErr := uc.dispatchAutomationOrder(ctx, item, order)
+	if dispatchErr == nil || uc.dispatchLanded(ctx, order.ID) {
+		if dispatchErr != nil {
+			// 同 runDueAutomation：派发动作已经把状态推进了，按成功处理。
+			logx.Warn(releaseAutomationLogComponent, "poll_dispatch_landed_with_error",
+				logx.F("automation_id", item.ID),
+				logx.F("order_id", order.ID),
+				logx.F("order_no", order.OrderNo),
+				logx.F("reason", dispatchErr.Error()),
+			)
+		}
+		logx.Info(releaseAutomationLogComponent, "poll_dispatch_resumed",
+			logx.F("automation_id", item.ID),
+			logx.F("order_id", order.ID),
+			logx.F("order_no", order.OrderNo),
+			logx.F("head_sha", orderHeadSHA),
+		)
+		uc.commitResumedOrder(ctx, item, order, orderHeadSHA, now)
+		return true, releaseAutomationRunTriggered
+	}
+
+	// 只是排在别的在途单后面，属于正常排队：保持这张单等待，不进入放弃计时。
+	if active, activeErr := uc.orders.FindActiveOrderByApplicationEnv(
+		ctx,
+		item.ApplicationID,
+		item.EnvCode,
+	); activeErr == nil {
+		reason := fmt.Sprintf(
+			"自动发布单 %s 等待在途发布单 %s 结束后派发",
+			firstNonEmpty(strings.TrimSpace(order.OrderNo), order.ID),
+			firstNonEmpty(strings.TrimSpace(active.OrderNo), active.ID),
+		)
+		uc.markCheckFailed(ctx, item, now, reason)
+		logx.Info(releaseAutomationLogComponent, "poll_dispatch_waiting_active_order",
+			logx.F("automation_id", item.ID),
+			logx.F("order_id", order.ID),
+			logx.F("active_order_no", firstNonEmpty(strings.TrimSpace(active.OrderNo), active.ID)),
+		)
+		return true, releaseAutomationRunBlocked
+	}
+
+	retryMinutes := int(releaseAutomationDispatchRetryWindow.Minutes())
+	reason := fmt.Sprintf(
+		"自动发布单 %s 派发失败，将在 %d 分钟内重试：%s",
+		firstNonEmpty(strings.TrimSpace(order.OrderNo), order.ID),
+		retryMinutes,
+		dispatchErr.Error(),
+	)
+	logx.Warn(releaseAutomationLogComponent, "poll_dispatch_retry_waiting",
+		logx.F("automation_id", item.ID),
+		logx.F("order_id", order.ID),
+		logx.F("order_no", order.OrderNo),
+		logx.F("reason", dispatchErr.Error()),
+	)
+	uc.markCheckFailed(ctx, item, now, reason)
+	if now.Sub(order.CreatedAt) < releaseAutomationDispatchRetryWindow {
+		return true, releaseAutomationRunFailed
+	}
+
+	uc.abandonUndispatchedOrder(ctx, item, order, orderHeadSHA, now, reason)
+	return true, releaseAutomationRunFailed
+}
+
+// commitResumedOrder 在补派发成功后推进基线。
+// 基线推到这张单的 HEAD 而不是当前分支 HEAD：补发的可能是旧提交，更新的提交
+// 留给下一轮按「HEAD 已前进」重新走建单流程。
+func (uc *ReleaseAutomationManager) commitResumedOrder(
+	ctx context.Context,
+	item automationdomain.Automation,
+	order releasedomain.ReleaseOrder,
+	orderHeadSHA string,
+	now time.Time,
+) {
+	if orderHeadSHA == "" {
+		return
+	}
+	committed, err := uc.repo.CommitTrigger(
+		ctx,
+		item.ID,
+		item.LastSeenSHA,
+		orderHeadSHA,
+		orderHeadSHA,
+		order.ID,
+		now,
+		"",
+	)
+	if err != nil {
+		logx.Error(releaseAutomationLogComponent, "poll_commit_trigger_failed", err,
+			logx.F("automation_id", item.ID),
+			logx.F("order_id", order.ID),
+			logx.F("head_sha", orderHeadSHA),
+		)
+		return
+	}
+	if !committed {
+		logx.Warn(releaseAutomationLogComponent, "poll_cas_conflict_discarded",
+			logx.F("automation_id", item.ID),
+			logx.F("order_id", order.ID),
+			logx.F("expected_seen_sha", item.LastSeenSHA),
+			logx.F("head_sha", orderHeadSHA),
+		)
+	}
+}
+
+// abandonUndispatchedOrder 放弃一张始终派发不出去的自动单。
+// 先推进基线再终止单子：顺序反过来时如果进程正好退出，下一轮会把同一个提交再建一次，
+// 形成「失败—重建」的循环。
+func (uc *ReleaseAutomationManager) abandonUndispatchedOrder(
+	ctx context.Context,
+	item automationdomain.Automation,
+	order releasedomain.ReleaseOrder,
+	orderHeadSHA string,
+	now time.Time,
+	reason string,
+) {
+	giveUpReason := fmt.Sprintf(
+		"自动派发超过 %d 分钟仍失败，已终止本次发布：%s",
+		int(releaseAutomationDispatchRetryWindow.Minutes()),
+		strings.TrimSpace(reason),
+	)
+	if orderHeadSHA != "" {
+		committed, err := uc.repo.CommitTrigger(
+			ctx,
+			item.ID,
+			item.LastSeenSHA,
+			orderHeadSHA,
+			orderHeadSHA,
+			order.ID,
+			now,
+			giveUpReason,
+		)
+		if err != nil {
+			logx.Error(releaseAutomationLogComponent, "poll_commit_trigger_failed", err,
+				logx.F("automation_id", item.ID),
+				logx.F("order_id", order.ID),
+				logx.F("head_sha", orderHeadSHA),
+			)
+		} else if !committed {
+			logx.Warn(releaseAutomationLogComponent, "poll_cas_conflict_discarded",
+				logx.F("automation_id", item.ID),
+				logx.F("order_id", order.ID),
+				logx.F("head_sha", orderHeadSHA),
+			)
+		}
+	}
+	if _, err := uc.orders.FailUndispatchedOrder(ctx, order.ID, giveUpReason); err != nil {
+		logx.Error(releaseAutomationLogComponent, "poll_dispatch_abandon_failed", err,
+			logx.F("automation_id", item.ID),
+			logx.F("order_id", order.ID),
+		)
+	}
+	logx.Error(releaseAutomationLogComponent, "poll_dispatch_abandoned",
+		errors.New(giveUpReason),
+		logx.F("automation_id", item.ID),
+		logx.F("order_id", order.ID),
+		logx.F("order_no", order.OrderNo),
+		logx.F("reason", giveUpReason),
+	)
+}
+
+// dispatchLanded 判断派发动作是否已经落到单子上。Build/Execute 可能先推进状态、
+// 再在收尾步骤报错（例如写执行人失败），这种「带错的成功」不能再当成没派发：
+// 否则基线不推进，等这张单跑完后会为同一个提交再建一单。
+// 等待审批的单（pending_approval）从建单起就不是 pending，同样按「已交给后续流程」处理。
+func (uc *ReleaseAutomationManager) dispatchLanded(ctx context.Context, orderID string) bool {
+	current, err := uc.orders.GetByID(ctx, orderID)
+	if err != nil {
+		return false
+	}
+	return current.Status != releasedomain.OrderStatusPending
+}
+
+// isAutomationOrderOf 判断发布单是否由这条自动化配置建出，避免改过配置身份后误操作
+// 上一张单。
+func isAutomationOrderOf(item automationdomain.Automation, order releasedomain.ReleaseOrder) bool {
+	if order.TriggerType != releasedomain.TriggerTypeAutomation {
+		return false
+	}
+	return strings.TrimSpace(order.ApplicationID) == strings.TrimSpace(item.ApplicationID) &&
+		strings.TrimSpace(order.EnvCode) == strings.TrimSpace(item.EnvCode) &&
+		strings.TrimSpace(order.GitRef) == strings.TrimSpace(item.GitRef)
 }
 
 // dispatchAutomationOrder 按配置的派发方式触发发布单。

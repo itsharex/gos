@@ -71,6 +71,42 @@ func TestListTrackableOrdersScansReleaseOrders(t *testing.T) {
 	}
 }
 
+// 自动化给手工单让路要有上限：截止时间之前创建的待执行单不能再被当成阻塞单，
+// 否则一张建完没人管的单会永久挡住同应用同环境的自动化。
+func TestFindOpenOrderByApplicationEnvHonorsCreatedAfter(t *testing.T) {
+	t.Parallel()
+
+	repo := newTestReleaseRepository(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	stale := newTestReleaseOrder("ro-stale", "RO-STALE", "app-1", "prod", domain.OrderStatusPending, now.Add(-48*time.Hour))
+	fresh := newTestReleaseOrder("ro-fresh", "RO-FRESH", "app-1", "prod", domain.OrderStatusPending, now.Add(-time.Hour))
+	for _, item := range []domain.ReleaseOrder{stale, fresh} {
+		if err := repo.Create(ctx, item, nil, nil, nil); err != nil {
+			t.Fatalf("Create(%s) failed: %v", item.OrderNo, err)
+		}
+	}
+
+	// 24 小时窗口内只剩 fresh，过期的 stale 不再阻塞。
+	order, err := repo.FindOpenOrderByApplicationEnv(ctx, "app-1", "prod", "", now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatalf("FindOpenOrderByApplicationEnv failed: %v", err)
+	}
+	if order.ID != fresh.ID {
+		t.Fatalf("blocking order = %q, want %q", order.ID, fresh.ID)
+	}
+
+	// 零值表示不设窗口：最旧的 stale 仍然是阻塞单。
+	order, err = repo.FindOpenOrderByApplicationEnv(ctx, "app-1", "prod", "", time.Time{})
+	if err != nil {
+		t.Fatalf("FindOpenOrderByApplicationEnv failed: %v", err)
+	}
+	if order.ID != stale.ID {
+		t.Fatalf("unfiltered blocking order = %q, want %q", order.ID, stale.ID)
+	}
+}
+
 func TestReleaseRepositorySchemaDoesNotCreateDeprecatedSonService(t *testing.T) {
 	for _, file := range []string{
 		"release_repository.go",
