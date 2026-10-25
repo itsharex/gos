@@ -158,6 +158,7 @@ flowchart LR
 - [Docker 部署说明](docss/部署/Docker部署说明.md)
 - [P0 到 P1 初始化指南](docss/使用手册/GOS从0到1初始化使用指南.md)
 - [应用接入向导](docs/first-release-onboarding.md)
+- [MCP 客户端接入与发布操作](docs/mcp-release-guide.md)
 - [Swagger / OpenAPI](docs/swagger.yaml)
 - 需求与设计文档：`docss/后端/`、`docss/前端/`、`docss/样式规范/`
 

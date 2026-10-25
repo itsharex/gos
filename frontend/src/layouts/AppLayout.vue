@@ -27,6 +27,9 @@ const hasPendingApprovalTasks = ref(false)
 let pendingApprovalRefreshTimer: ReturnType<typeof window.setInterval> | null = null
 
 const activeMenuKey = computed(() => {
+  if (route.path.startsWith('/me/mcp-tokens')) {
+    return ['personal-mcp-tokens']
+  }
   if (route.path.startsWith('/system/users')) {
     return ['system-users']
   }
@@ -355,6 +358,10 @@ function goToArtifactCenter() {
   void router.push('/artifacts')
 }
 
+function goToPersonalMCPTokens() {
+  void router.push('/me/mcp-tokens')
+}
+
 function goToSystemUsers() {
   void router.push('/system/users')
 }
@@ -595,6 +602,13 @@ onUnmounted(() => {
             系统设置
           </a-menu-item>
         </a-sub-menu>
+
+        <a-menu-item key="personal-mcp-tokens" @click="goToPersonalMCPTokens">
+          <template #icon>
+            <UserOutlined />
+          </template>
+          个人 MCP 令牌
+        </a-menu-item>
       </a-menu>
       <div class="sider-footer">
         <div class="sider-footer-row">
