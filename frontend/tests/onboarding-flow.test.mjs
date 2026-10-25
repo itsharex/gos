@@ -17,7 +17,7 @@ test('onboarding is a permanent route and supports a new application after compl
   assert.ok(wizard.includes('继续接入下一个应用'))
 })
 test('draft saving is serialized and never disables parameter editing while a save is pending', () => {
-  assert.ok(wizard.includes('if (pendingSave) await pendingSave'))
+  assert.ok(wizard.includes('while (pendingSave) await pendingSave'))
   assert.ok(wizard.includes('}, 800)'))
   assert.ok(wizard.includes('onBeforeRouteLeave'))
   assert.ok(wizard.includes('onBeforeRouteUpdate'))
