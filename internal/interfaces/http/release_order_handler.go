@@ -1160,17 +1160,19 @@ func (h *ReleaseOrderHandler) ListAppReleaseStateSummaries(c *gin.Context) {
 	if !ensureAnyReleaseOrderDisplayPermission(c, h.authz) {
 		return
 	}
-	allowAll, visibleApplicationIDs, _, ok := resolveVisibleReleaseOrderApplicationIDs(c, h.authz)
+	allowAll, visibleApplicationIDs, visibleEnvScopes, ok := resolveVisibleReleaseOrderApplicationIDs(c, h.authz)
 	if !ok {
 		return
 	}
 	requestedIDs := splitTrimmedCSV(c.Query("application_ids"))
 	if !allowAll {
+		// 状态仓储只接受应用 ID；环境授权在取数后仍须按环境过滤。
+		allowedIDs := releaseCandidateApplicationIDs(visibleApplicationIDs, visibleEnvScopes)
 		if len(requestedIDs) == 0 {
-			requestedIDs = append([]string(nil), visibleApplicationIDs...)
+			requestedIDs = allowedIDs
 		} else {
-			allowed := make(map[string]struct{}, len(visibleApplicationIDs))
-			for _, item := range visibleApplicationIDs {
+			allowed := make(map[string]struct{}, len(allowedIDs))
+			for _, item := range allowedIDs {
 				allowed[item] = struct{}{}
 			}
 			filtered := make([]string, 0, len(requestedIDs))
@@ -1181,14 +1183,27 @@ func (h *ReleaseOrderHandler) ListAppReleaseStateSummaries(c *gin.Context) {
 			}
 			requestedIDs = filtered
 		}
+		if len(requestedIDs) == 0 {
+			c.JSON(http.StatusOK, gin.H{"data": []AppReleaseStateSummaryResponse{}})
+			return
+		}
 	}
 	items, err := h.manager.ListCurrentAppReleaseStateSummaries(c.Request.Context(), requestedIDs)
 	if err != nil {
 		writeReleaseOrderHTTPError(c, err)
 		return
 	}
+	visibleScopes := make(map[string]struct{}, len(visibleEnvScopes))
+	for _, scope := range visibleEnvScopes {
+		visibleScopes[buildApplicationEnvScopeValue(scope.ApplicationID, scope.EnvCode)] = struct{}{}
+	}
 	resp := make([]AppReleaseStateSummaryResponse, 0, len(items))
 	for _, item := range items {
+		if !allowAll && !containsString(visibleApplicationIDs, item.ApplicationID) {
+			if _, allowed := visibleScopes[buildApplicationEnvScopeValue(item.ApplicationID, item.EnvCode)]; !allowed {
+				continue
+			}
+		}
 		resp = append(resp, toAppReleaseStateSummaryResponse(item))
 	}
 	c.JSON(http.StatusOK, gin.H{"data": resp})
@@ -1455,7 +1470,7 @@ func (h *ReleaseOrderHandler) ListSchedules(c *gin.Context) {
 		return
 	}
 	applicationID := strings.TrimSpace(c.Query("application_id"))
-	allowAll, visibleApplicationIDs, _, ok := resolveVisibleReleaseOrderApplicationIDs(c, h.authz)
+	allowAll, visibleApplicationIDs, visibleEnvScopes, ok := resolveVisibleReleaseOrderApplicationIDs(c, h.authz)
 	if !ok {
 		return
 	}
@@ -1463,9 +1478,10 @@ func (h *ReleaseOrderHandler) ListSchedules(c *gin.Context) {
 	if !allowAll {
 		visibleToUserID = currentUser.ID
 	}
+	// 排程列表还按创建人/审批人过滤，保留其原有的应用 ID 候选集合。
 	items, total, err := h.manager.ListSchedules(c.Request.Context(), usecase.ListReleaseOrderScheduleInput{
 		ApplicationID:          applicationID,
-		ApplicationIDs:         resolveReleaseListApplicationIDs(applicationID, allowAll, visibleApplicationIDs),
+		ApplicationIDs:         resolveReleaseListApplicationIDs(applicationID, allowAll, releaseCandidateApplicationIDs(visibleApplicationIDs, visibleEnvScopes)),
 		VisibleToUserID:        visibleToUserID,
 		ApprovalApproverUserID: strings.TrimSpace(c.Query("approval_approver_user_id")),
 		CreatorUserID:          strings.TrimSpace(c.Query("creator_user_id")),
@@ -3868,9 +3884,9 @@ func resolveVisibleReleaseOrderApplicationIDs(
 		"release.execute": {},
 		"release.cancel":  {},
 	}
+	// SQL 中的 ApplicationIDs 表示整个应用授权，环境授权由独立的 envScopes 条件处理。
 	applicationIDs, envScopes = collectApplicationScopesFromPermissions(items, accepted)
-	applicationIDs = mergeReleaseVisibleApplicationIDs(applicationIDs, envScopes)
-	return false, applicationIDs, envScopes, true
+	return false, mergeReleaseVisibleApplicationIDs(applicationIDs, envScopes), envScopes, true
 }
 
 // resolveReleaseListApplicationIDs 解析上下文数据，得到后续流程需要的结果。
@@ -3945,39 +3961,25 @@ func canViewReleaseOrderApplication(
 		return false, err
 	}
 	applicationIDs, envScopes := collectApplicationScopesFromPermissions(items, accepted)
-	applicationIDs = mergeReleaseVisibleApplicationIDs(applicationIDs, envScopes)
 	if containsString(applicationIDs, appID) {
 		return true, nil
 	}
-
-	for _, code := range []string{"release.view", "release.create", "release.execute", "release.cancel"} {
-		allowed, err := authz.HasPermission(ctx, user, code, "application", appID)
-		if err != nil {
-			return false, err
-		}
-		if allowed {
+	for _, scope := range envScopes {
+		if strings.TrimSpace(scope.ApplicationID) == appID && strings.TrimSpace(scope.EnvCode) == strings.TrimSpace(envCode) {
 			return true, nil
-		}
-		if env := strings.TrimSpace(envCode); env != "" {
-			allowed, err = authz.HasPermission(ctx, user, code, "application_env", buildApplicationEnvScopeValue(appID, env))
-			if err != nil {
-				return false, err
-			}
-			if allowed {
-				return true, nil
-			}
 		}
 	}
 	return false, nil
 }
 
-// mergeReleaseVisibleApplicationIDs 封装当前模块的业务处理逻辑。
+// mergeReleaseVisibleApplicationIDs 返回可传入发布单 SQL 的全应用授权 ID。
+// 环境授权必须通过独立的 ApplicationEnvScope 条件使用，不能提升为应用授权。
 func mergeReleaseVisibleApplicationIDs(
 	applicationIDs []string,
-	envScopes []domain.ApplicationEnvScope,
+	_ []domain.ApplicationEnvScope,
 ) []string {
-	seen := make(map[string]struct{}, len(applicationIDs)+len(envScopes))
-	result := make([]string, 0, len(applicationIDs)+len(envScopes))
+	seen := make(map[string]struct{}, len(applicationIDs))
+	result := make([]string, 0, len(applicationIDs))
 	for _, item := range applicationIDs {
 		appID := strings.TrimSpace(item)
 		if appID == "" {
@@ -3989,19 +3991,17 @@ func mergeReleaseVisibleApplicationIDs(
 		seen[appID] = struct{}{}
 		result = append(result, appID)
 	}
-	for _, item := range envScopes {
-		appID := strings.TrimSpace(item.ApplicationID)
-		if appID == "" {
-			continue
-		}
-		if _, exists := seen[appID]; exists {
-			continue
-		}
-		seen[appID] = struct{}{}
-		result = append(result, appID)
-	}
 	sort.Strings(result)
 	return result
+}
+
+// releaseCandidateApplicationIDs 仅供需要按应用 ID 预取再按环境过滤的读取使用。
+func releaseCandidateApplicationIDs(applicationIDs []string, envScopes []domain.ApplicationEnvScope) []string {
+	candidates := append([]string(nil), applicationIDs...)
+	for _, scope := range envScopes {
+		candidates = append(candidates, scope.ApplicationID)
+	}
+	return mergeReleaseVisibleApplicationIDs(candidates, nil)
 }
 
 // writeEmptyReleaseOrderList 写入处理结果或错误信息。

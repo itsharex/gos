@@ -232,6 +232,55 @@ func TestReleaseAutomationRepositoryCommitTriggerIsConditional(t *testing.T) {
 	}
 }
 
+// RecordOrder 只记录建单结果，不能推进基线：派发失败的那一轮必须让同一个提交
+// 继续被认领，否则「建单成功、派发失败」的提交会被静默吞掉。
+func TestReleaseAutomationRepositoryRecordOrderKeepsBaseline(t *testing.T) {
+	t.Parallel()
+
+	repo, _ := newTestReleaseAutomationRepository(t)
+	ctx := context.Background()
+	now := time.Unix(1700000000, 0).UTC()
+
+	item := newTestReleaseAutomation("rauto-1", "app-1", "prod", "main", now)
+	item.LastSeenSHA = "sha-1"
+	if err := repo.Create(ctx, item); err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+
+	// 过期的期望值：另一个副本已经推进过基线，本次必须不生效。
+	committed, err := repo.RecordOrder(ctx, item.ID, "sha-0", "sha-2", "ro-1", now.Add(time.Minute), "dispatch failed")
+	if err != nil {
+		t.Fatalf("RecordOrder failed: %v", err)
+	}
+	if committed {
+		t.Fatalf("RecordOrder with a stale expectation committed, want false")
+	}
+
+	committed, err = repo.RecordOrder(ctx, item.ID, "sha-1", "sha-2", "ro-1", now.Add(2*time.Minute), "dispatch failed")
+	if err != nil {
+		t.Fatalf("RecordOrder failed: %v", err)
+	}
+	if !committed {
+		t.Fatalf("RecordOrder with the matching expectation did not commit")
+	}
+	current, err := repo.GetByID(ctx, item.ID)
+	if err != nil {
+		t.Fatalf("GetByID failed: %v", err)
+	}
+	if current.LastSeenSHA != "sha-1" {
+		t.Fatalf("LastSeenSHA = %q, want the baseline kept at sha-1", current.LastSeenSHA)
+	}
+	if current.LastTriggeredSHA != "sha-2" || current.LastOrderID != "ro-1" {
+		t.Fatalf("trigger trace = %q / %q, want sha-2 / ro-1", current.LastTriggeredSHA, current.LastOrderID)
+	}
+	if current.LastError != "dispatch failed" {
+		t.Fatalf("LastError = %q, want the dispatch reason", current.LastError)
+	}
+	if current.LastCheckedAt == nil || !current.LastCheckedAt.Equal(now.Add(2*time.Minute)) {
+		t.Fatalf("LastCheckedAt = %v", current.LastCheckedAt)
+	}
+}
+
 func TestReleaseAutomationRepositoryResetBaselineIsGuarded(t *testing.T) {
 	t.Parallel()
 

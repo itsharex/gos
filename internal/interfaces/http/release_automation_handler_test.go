@@ -124,6 +124,12 @@ func (r *releaseAutomationHTTPRepo) CommitTrigger(
 	return true, nil
 }
 
+func (r *releaseAutomationHTTPRepo) RecordOrder(
+	context.Context, string, string, string, string, time.Time, string,
+) (bool, error) {
+	return true, nil
+}
+
 type releaseAutomationHTTPAppStub struct{}
 
 func (releaseAutomationHTTPAppStub) GetByID(context.Context, string) (appdomain.Application, error) {
@@ -175,8 +181,16 @@ func (releaseAutomationHTTPOrderStub) FindActiveOrderByApplicationEnv(context.Co
 	return releasedomain.ReleaseOrder{}, releasedomain.ErrOrderNotFound
 }
 
-func (releaseAutomationHTTPOrderStub) FindOpenOrderByApplicationEnv(context.Context, string, string, string) (releasedomain.ReleaseOrder, error) {
+func (releaseAutomationHTTPOrderStub) FindOpenOrderByApplicationEnv(context.Context, string, string, string, time.Time) (releasedomain.ReleaseOrder, error) {
 	return releasedomain.ReleaseOrder{}, releasedomain.ErrOrderNotFound
+}
+
+func (releaseAutomationHTTPOrderStub) GetByID(context.Context, string) (releasedomain.ReleaseOrder, error) {
+	return releasedomain.ReleaseOrder{}, releasedomain.ErrOrderNotFound
+}
+
+func (releaseAutomationHTTPOrderStub) FailUndispatchedOrder(context.Context, string, string) (bool, error) {
+	return true, nil
 }
 
 type releaseAutomationHTTPGitStub struct {

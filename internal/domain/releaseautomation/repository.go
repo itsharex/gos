@@ -51,4 +51,17 @@ type Repository interface {
 		checkedAt time.Time,
 		lastError string,
 	) (bool, error)
+
+	// RecordOrder 与 CommitTrigger 一样是 CAS 写回，但**不推进基线**：只记录本轮建出的
+	// 发布单和检查结果。派发失败时用它把单子挂到配置上，下一轮才能找到它补派发；基线
+	// 保持原值，这个提交会继续被认领，直到派发成功或超时放弃。
+	RecordOrder(
+		ctx context.Context,
+		id string,
+		expectedSeenSHA string,
+		triggeredSHA string,
+		orderID string,
+		checkedAt time.Time,
+		lastError string,
+	) (bool, error)
 }

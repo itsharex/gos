@@ -3124,25 +3124,22 @@ func (r *ReleaseRepository) FindOpenOrderByApplicationEnv(
 	applicationID string,
 	envCode string,
 	excludeReleaseOrderID string,
+	createdAfter time.Time,
 ) (domain.ReleaseOrder, error) {
 	applicationID = strings.TrimSpace(applicationID)
 	envCode = strings.TrimSpace(envCode)
 	if applicationID == "" || envCode == "" {
 		return domain.ReleaseOrder{}, domain.ErrOrderNotFound
 	}
-	const q = `
+	q := `
 SELECT id, order_no, release_name, previous_order_no, operation_type, source_order_id, source_order_no, is_concurrent, concurrent_batch_no, concurrent_batch_name, concurrent_batch_seq, application_id, application_name, template_id, template_name, delivery_engine, strategy_snapshot_json, binding_id, pipeline_id, env_code, git_ref, head_commit_sha, head_commit_ref, head_change_sha, head_change_title, head_change_author, head_change_at, head_change_url, image_tag,
 	trigger_type, status, approval_required, approval_mode, approval_approver_ids_json, approval_approver_names_json, approved_at, approved_by, rejected_at, rejected_by, rejected_reason, remark, creator_user_id, triggered_by, executor_user_id, executor_name, started_at, finished_at, created_at, updated_at
 FROM release_order
 WHERE application_id = ?
   AND env_code = ?
   AND id <> ?
-  AND status IN (?, ?, ?, ?, ?, ?, ?)
-ORDER BY created_at ASC, id ASC
-LIMIT 1;`
-	row := r.db.QueryRowContext(
-		ctx,
-		q,
+  AND status IN (?, ?, ?, ?, ?, ?, ?)`
+	args := []any{
 		applicationID,
 		envCode,
 		strings.TrimSpace(excludeReleaseOrderID),
@@ -3153,7 +3150,16 @@ LIMIT 1;`
 		string(domain.OrderStatusRunning),
 		string(domain.OrderStatusDeploying),
 		string(domain.OrderStatusBuiltWaitingDeploy),
-	)
+	}
+	if !createdAfter.IsZero() {
+		q += `
+  AND created_at >= ?`
+		args = append(args, createdAfter.UTC().UnixNano())
+	}
+	q += `
+ORDER BY created_at ASC, id ASC
+LIMIT 1;`
+	row := r.db.QueryRowContext(ctx, q, args...)
 	item, err := scanReleaseOrder(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

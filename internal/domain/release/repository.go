@@ -36,7 +36,10 @@ type Repository interface {
 	FindActiveOrderByApplicationEnv(ctx context.Context, applicationID string, envCode string, excludeReleaseOrderID string) (ReleaseOrder, error)
 	// FindOpenOrderByApplicationEnv 返回同应用同环境下「尚未结束」的发布单（含待执行/已批准/
 	// 排队/构建/部署中/已构建待部署），用于自动化触发前判断是否已有手工发布排在前面。
-	FindOpenOrderByApplicationEnv(ctx context.Context, applicationID string, envCode string, excludeReleaseOrderID string) (ReleaseOrder, error)
+	//
+	// createdAfter 非零时只统计该时间之后创建的单：长期停在待执行的人为弃单不应该
+	// 永久挡住后续自动化，调用方用它实现「让路有时间上限」。
+	FindOpenOrderByApplicationEnv(ctx context.Context, applicationID string, envCode string, excludeReleaseOrderID string, createdAfter time.Time) (ReleaseOrder, error)
 	CountActiveOrdersByApplicationEnv(ctx context.Context, applicationID string, envCode string, excludeReleaseOrderID string) (int, error)
 	FindActiveExecutionLock(ctx context.Context, lockKey string, excludeReleaseOrderID string, now time.Time) (ReleaseExecutionLock, error)
 	AcquireExecutionLock(ctx context.Context, lock ReleaseExecutionLock, now time.Time) (ReleaseExecutionLock, bool, error)
